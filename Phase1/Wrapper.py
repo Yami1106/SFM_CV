@@ -31,7 +31,10 @@ from Visualizations import (
     save_reprojection_overlay,
     save_pointcloud_xz,
     save_pointcloud_compare_xz,
+    save_candidate_poses_xz,
+    save_pnp_compare_xz,
     save_ba_before_after_xz,
+    save_final_reconstruction,
 )
 
 OUT = "outputs"
@@ -39,43 +42,10 @@ os.makedirs(OUT, exist_ok=True)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Final reconstruction plot (inlined — not in provided Visualizations.py)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def save_final_reconstruction(X_before, X_after, Cset, Rset, out_path, title="Final Reconstruction (X vs Z)"):
-    """
-    Blue = before BA, red = after BA, green triangles = camera positions.
-    Matches the reference image style.
-    """
-    fig, ax = plt.subplots(figsize=(8, 8))
-    ax.scatter(X_before[:, 0], X_before[:, 2], s=4, c='blue', alpha=0.5, label='before bund adj')
-    ax.scatter(X_after[:,  0], X_after[:,  2], s=4, c='red',  alpha=0.5, label='after bund adj')
-
-    for i, C in enumerate(Cset):
-        ax.scatter(C[0], C[2], marker='^', s=120, c='green',
-                   zorder=5, edgecolors='black', linewidths=0.5)
-        ax.text(C[0] + 0.05, C[2] + 0.05, str(i + 1),
-                fontsize=8, color='purple', fontweight='bold', zorder=6)
-
-    ax.legend(fontsize=9)
-    ax.set_title(title)
-    ax.set_xlabel("x")
-    ax.set_ylabel("z")
-    plt.tight_layout()
-    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
-    plt.savefig(out_path, dpi=200, bbox_inches="tight")
-    plt.close()
-    print(f"  Saved {out_path}")
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 # Outlier filter — returns both filtered array AND boolean keep mask
 # ─────────────────────────────────────────────────────────────────────────────
 
 def filter_outliers_with_mask(X: np.ndarray, percentile: int = 95):
-    """
-    Returns (X_filtered, keep_mask) so callers can also filter tracks in sync.
-    """
     if len(X) == 0:
         return X, np.ones(0, dtype=bool)
     median = np.median(X, axis=0)
@@ -88,6 +58,12 @@ def filter_outliers_with_mask(X: np.ndarray, percentile: int = 95):
 def filter_outliers(X: np.ndarray, percentile: int = 95) -> np.ndarray:
     X_f, _ = filter_outliers_with_mask(X, percentile)
     return X_f
+
+
+def filter_tracks_and_points(X: np.ndarray, tracks: list, percentile: int = 90):
+    X_filtered, keep = filter_outliers_with_mask(X, percentile)
+    tracks_filtered  = [tracks[j] for j in range(len(tracks)) if keep[j]]
+    return X_filtered, tracks_filtered
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -107,12 +83,6 @@ def load_image(data_dir: str, idx: int):
 
 
 def load_matches(data_dir: str):
-    """
-    Format per line:
-      nMatches R G B u1 v1  target u2 v2  [target u2 v2 ...]
-    Returns:
-      matches: dict (i,j) -> (x_i (N,2), x_j (N,2))  0-based indices
-    """
     import glob, re
     matches = {}
 
@@ -172,7 +142,6 @@ def collect_pnp_correspondences(cam_i, X, tracks):
     for j, track in enumerate(tracks):
         if cam_i in track:
             if j >= len(X):
-                # tracks and X are out of sync — skip stale track
                 continue
             X_list.append(X[j])
             x_list.append(track[cam_i])
@@ -212,7 +181,6 @@ def populate_tracks_for_new_camera(cam_i, tracks, clean):
 
 
 def find_best_reference_camera(cam_i, registered, clean):
-    """Find already-registered camera with most matches to cam_i."""
     best_ref, best_count = 0, 0
     for k in registered:
         key_fwd = (k, cam_i)
@@ -229,20 +197,6 @@ def find_best_reference_camera(cam_i, registered, clean):
     return best_ref
 
 
-def filter_tracks_and_points(X: np.ndarray, tracks: list, percentile: int = 90):
-    """
-    Filter outlier 3D points and remove the corresponding track entries,
-    keeping X and tracks in sync.
-
-    Returns:
-      X_filtered:      (M,3) filtered points
-      tracks_filtered: list of M track dicts
-    """
-    X_filtered, keep = filter_outliers_with_mask(X, percentile)
-    tracks_filtered  = [tracks[j] for j in range(len(tracks)) if keep[j]]
-    return X_filtered, tracks_filtered
-
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Main pipeline
 # ─────────────────────────────────────────────────────────────────────────────
@@ -257,26 +211,43 @@ def run_sfm(data_dir: str, calib_file: str, num_images: int):
     matches = load_matches(data_dir)
     images  = [load_image(data_dir, i) for i in range(num_images)]
 
+    np.save(os.path.join(OUT, "matches_raw.npy"), matches)
+
     # ── Step 1: RANSAC filter all pairs ──────────────────────────
     print("\n[1] Filtering correspondences with RANSAC...")
     clean = {}
     for (i, j), (x_i, x_j) in matches.items():
-        mask         = GetInliersRANSAC(x_i, x_j)
+        mask = GetInliersRANSAC(x_i, x_j)
+        if mask.shape[0] != x_i.shape[0]:
+            print(f"  WARNING: mask length mismatch for pair ({i+1},{j+1}) - skipping")
+            clean[(i,j)] = (np.zeros((0,2)), np.zeros((0,2)))
+            continue
+
         clean[(i,j)] = (x_i[mask], x_j[mask])
         print(f"  Pair ({i+1},{j+1}): {mask.sum()} / {len(mask)} inliers")
 
         if images[i] is not None and images[j] is not None:
+            out_path = os.path.join(OUT, f"matches_{i+1}_{j+1}.png")
             save_matches_ransac(
                 images[i], images[j], x_i, x_j, mask,
-                out_path=os.path.join(OUT, f"matches_{i+1}_{j+1}.png")
+                out_path=out_path
             )
+            print(f"  Saved {out_path}")
+
+    np.save(os.path.join(OUT, "matches_clean.npy"), clean)
 
     # ── Step 2: Bootstrap — images 1 & 2 ─────────────────────────
     print("\n[2] Bootstrapping from images 1 & 2...")
+    if (0, 1) not in clean or len(clean[(0,1)][0]) < 8:
+        raise RuntimeError("Not enough inliers between images 1 and 2 to bootstrap (need >=8)")
+
     x1, x2 = clean[(0, 1)]
 
     F  = EstimateFundamentalMatrix(x1, x2)
+    np.save(os.path.join(OUT, "F_1_2.npy"), F)
     E  = EfromF(F, K)
+    np.save(os.path.join(OUT, "E_1_2.npy"), E)
+
     Cset_cand, Rset_cand = ExtractCameraPose(E)
 
     C0, R0    = np.zeros(3), np.eye(3)
@@ -285,40 +256,56 @@ def run_sfm(data_dir: str, calib_file: str, num_images: int):
         for k in range(4)
     ]
 
+    save_candidate_poses_xz(
+        Xset_cand,
+        out_path=os.path.join(OUT, "candidate_poses_xz.png"),
+        title="initial triangulation"
+    )
     for k in range(4):
-        save_pointcloud_xz(
-            Xset_cand[k],
-            out_path=os.path.join(OUT, f"candidate_{k+1}_xz.png"),
-            title=f"Candidate pose {k+1}"
-        )
+        np.save(os.path.join(OUT, f"X_candidate_k{k+1}.npy"), Xset_cand[k])
 
     C2, R2, X_lin = DisambiguateCameraPose(K, Cset_cand, Rset_cand, x1, x2)
     print(f"  Pose disambiguated — {len(X_lin)} points triangulated")
 
+    np.save(os.path.join(OUT, "C_bootstrap.npy"), np.vstack([C0, C2]))
+    np.save(os.path.join(OUT, "R_bootstrap.npy"), np.stack([R0, R2]))
+
     X_nonlin = NonlinearTriangulation(K, C0, R0, C2, R2, x1, x2, X_lin)
+    np.save(os.path.join(OUT, "X_nonlinear_init.npy"), X_nonlin)
+
     X_nonlin = filter_outliers(X_nonlin)
     print(f"  After outlier filter — {len(X_nonlin)} points remaining")
+    np.save(os.path.join(OUT, "X_nonlinear_init_filtered.npy"), X_nonlin)
 
     save_pointcloud_compare_xz(
         X_lin, X_nonlin,
         out_path=os.path.join(OUT, "linear_vs_nonlinear_1_2.png"),
-        title="Linear vs Nonlinear — images 1 & 2"
+        title="Linear vs Nonlinear — images 1 & 2",
+        Cset=[C0, C2],
+        Rset=[R0, R2]
     )
+    print(f"  Saved {os.path.join(OUT, 'linear_vs_nonlinear_1_2.png')}")
 
     for cam_idx, (C, R, x_obs) in enumerate([(C0, R0, x1), (C2, R2, x2)]):
-        if images[cam_idx] is not None:
+        real_idx = [0, 1][cam_idx]
+        if images[real_idx] is not None:
+            out_lin = os.path.join(OUT, f"reproj_linear_cam{real_idx+1}.png")
             save_reprojection_overlay(
-                images[cam_idx], x_obs,
+                images[real_idx], x_obs,
                 reproject(K, C, R, X_lin),
-                out_path=os.path.join(OUT, f"reproj_linear_cam{cam_idx+1}.png"),
-                title=f"Linear reprojection — camera {cam_idx+1}"
+                out_path=out_lin,
+                title=f"lin reproj vis, frame {real_idx}"
             )
+            print(f"  Saved {out_lin}")
+
+            out_nonlin = os.path.join(OUT, f"reproj_nonlinear_cam{real_idx+1}.png")
             save_reprojection_overlay(
-                images[cam_idx], x_obs,
+                images[real_idx], x_obs,
                 reproject(K, C, R, X_nonlin),
-                out_path=os.path.join(OUT, f"reproj_nonlinear_cam{cam_idx+1}.png"),
-                title=f"Nonlinear reprojection — camera {cam_idx+1}"
+                out_path=out_nonlin,
+                title=f"nonlin reproj vis, frame {real_idx}"
             )
+            print(f"  Saved {out_nonlin}")
 
     # initialise global state
     X          = X_nonlin.copy()
@@ -327,7 +314,13 @@ def run_sfm(data_dir: str, calib_file: str, num_images: int):
     registered = [0, 1]
     tracks     = [{0: tuple(x1[j]), 1: tuple(x2[j])} for j in range(len(X))]
 
-    # ── Step 3: Register cameras 3, 4, 5 incrementally ───────────
+    # ── CHANGE 1: save the very first point cloud right after bootstrap ──
+    X_very_beginning = X.copy()
+
+    np.save(os.path.join(OUT, "tracks_init.npy"), tracks)
+    np.save(os.path.join(OUT, "X_init.npy"), X)
+
+    # ── Step 3: Register cameras 3..I ───────────────────────────
     for i in range(2, num_images):
         print(f"\n[3] Registering camera {i+1}...")
 
@@ -340,27 +333,42 @@ def run_sfm(data_dir: str, calib_file: str, num_images: int):
             print(f"  Skipping camera {i+1}: not enough correspondences (need ≥6)")
             continue
 
-        C_new, R_new, pnp_mask = PnPRANSAC(X_pnp, x_pnp, K, epsilon=10.0)
+        C_lin_pnp, R_lin_pnp, pnp_mask = PnPRANSAC(X_pnp, x_pnp, K, epsilon=10.0)
         print(f"  PnP RANSAC inliers: {pnp_mask.sum()} / {len(pnp_mask)}")
+
+        np.save(os.path.join(OUT, f"PnP_linear_cam{i+1}.npy"), np.hstack([C_lin_pnp.reshape(1,3), np.zeros((1,0))]))
+        np.save(os.path.join(OUT, f"PnP_inliers_mask_cam{i+1}.npy"), pnp_mask)
 
         if pnp_mask.sum() < 6:
             print(f"  Skipping camera {i+1}: too few PnP inliers ({pnp_mask.sum()})")
             continue
 
         C_new, R_new = NonlinearPnP(
-            X_pnp[pnp_mask], x_pnp[pnp_mask], K, C_new, R_new,
+            X_pnp[pnp_mask], x_pnp[pnp_mask], K, C_lin_pnp, R_lin_pnp,
             max_nfev=200
         )
+
+        out_pnp = os.path.join(OUT, f"pnp_compare_cam{i+1}.png")
+        save_pnp_compare_xz(
+            X_pnp,
+            C_lin_pnp, R_lin_pnp,
+            C_new,     R_new,
+            Cset, Rset,
+            out_path=out_pnp,
+            title=f"Linear vs Nonlinear PnP — camera {i+1}"
+        )
+        print(f"  Saved {out_pnp}")
+
+        np.save(os.path.join(OUT, f"C_pnp_cam{i+1}.npy"), C_new)
+        np.save(os.path.join(OUT, f"R_pnp_cam{i+1}.npy"), R_new)
 
         Cset.append(C_new)
         Rset.append(R_new)
         registered.append(i)
 
-        # use best reference camera for triangulation (reduces drift)
-        ref       = find_best_reference_camera(i, registered[:-1], clean)
-        ref_idx   = registered.index(ref)
-        ref_C     = Cset[ref_idx]
-        ref_R     = Rset[ref_idx]
+        ref = find_best_reference_camera(i, registered[:-1], clean)
+        ref_idx = registered.index(ref)
+        ref_C, ref_R = Cset[ref_idx], Rset[ref_idx]
         print(f"  Using camera {ref+1} as triangulation reference")
 
         key_fwd = (ref, i)
@@ -376,69 +384,137 @@ def run_sfm(data_dir: str, calib_file: str, num_images: int):
         if xa is not None:
             X_new_l  = LinearTriangulation(K, ref_C, ref_R, C_new, R_new, xa, xb)
             X_new_nl = NonlinearTriangulation(K, ref_C, ref_R, C_new, R_new, xa, xb, X_new_l)
+
+            np.save(os.path.join(OUT, f"X_new_linear_cam{i+1}.npy"), X_new_l)
+            np.save(os.path.join(OUT, f"X_new_nonlinear_cam{i+1}.npy"), X_new_nl)
+
             X_new_nl = filter_outliers(X_new_nl)
             print(f"  Triangulated {len(X_new_nl)} new points (after filter)")
 
+            out_lin_vs_nl = os.path.join(OUT, f"linear_vs_nonlinear_cam{i+1}.png")
             save_pointcloud_compare_xz(
                 X_new_l, X_new_nl,
-                out_path=os.path.join(OUT, f"linear_vs_nonlinear_cam{i+1}.png"),
-                title=f"Linear vs Nonlinear — camera {i+1}"
+                out_path=out_lin_vs_nl,
+                title=f"Linear vs Nonlinear — camera {i+1}",
+                Cset=Cset,
+                Rset=Rset
             )
+            print(f"  Saved {out_lin_vs_nl}")
 
             for cam_idx, (C, R, x_obs) in enumerate([(ref_C, ref_R, xa), (C_new, R_new, xb)]):
                 real_idx = [ref, i][cam_idx]
                 if images[real_idx] is not None:
+                    out_reproj = os.path.join(OUT, f"reproj_cam{real_idx+1}_after_cam{i+1}.png")
                     save_reprojection_overlay(
                         images[real_idx], x_obs,
                         reproject(K, C, R, X_new_nl),
-                        out_path=os.path.join(OUT, f"reproj_cam{real_idx+1}_after_cam{i+1}.png"),
+                        out_path=out_reproj,
                         title=f"Reprojection cam {real_idx+1} (after cam {i+1})"
                     )
+                    print(f"  Saved {out_reproj}")
 
-            # Append new points and their tracks together, then sync-filter
             for k in range(len(X_new_nl)):
                 tracks.append({ref: tuple(xa[k]), i: tuple(xb[k])})
             X = np.vstack([X, X_new_nl])
 
-        # BA after each camera
+            np.save(os.path.join(OUT, f"X_after_triangulation_cam{i+1}.npy"), X)
+
         V = BuildVisibilityMatrix(tracks, num_cameras=len(Cset), num_points=len(X))
         print(f"  Bundle Adjustment ({len(Cset)} cameras, {len(X)} points)...")
+        X_before_step = X.copy()
+        np.save(os.path.join(OUT, f"X_before_BA_cam{i+1}.npy"), X_before_step)
+
         Cset, Rset, X = BundleAdjustment(K, Cset, Rset, X, tracks, V, max_nfev=50)
 
-        # ── FIX: filter outliers from BOTH X and tracks in sync ──
+        np.save(os.path.join(OUT, f"X_after_BA_cam{i+1}.npy"), X)
+        np.save(os.path.join(OUT, f"Cset_after_BA_cam{i+1}.npy"), np.array(Cset))
+        np.save(os.path.join(OUT, f"Rset_after_BA_cam{i+1}.npy"), np.array(Rset))
+
+        out_ba = os.path.join(OUT, f"ba_after_cam{i+1}.png")
+        save_ba_before_after_xz(
+            X_before_step, X,
+            out_path=out_ba,
+            title=f"Bundle Adjustment after camera {i+1}",
+            Cset=Cset,
+            Rset=Rset
+        )
+        print(f"  Saved {out_ba}")
+
         X, tracks = filter_tracks_and_points(X, tracks, percentile=90)
         print(f"  After outlier filter — {len(X)} points remaining")
+        np.save(os.path.join(OUT, f"X_filtered_after_cam{i+1}.npy"), X)
+        np.save(os.path.join(OUT, f"tracks_after_cam{i+1}.npy"), tracks)
 
     # ── Step 4: Final BA ──────────────────────────────────────────
     print(f"\n[4] Final Bundle Adjustment ({len(Cset)} cameras, {len(X)} points)...")
     V             = BuildVisibilityMatrix(tracks, num_cameras=len(Cset), num_points=len(X))
     X_before_ba   = X.copy()
+    np.save(os.path.join(OUT, "X_before_final_BA.npy"), X_before_ba)
+
     Cset, Rset, X = BundleAdjustment(K, Cset, Rset, X, tracks, V, max_nfev=50)
+
+    np.save(os.path.join(OUT, "X_after_final_BA.npy"), X)
+    np.save(os.path.join(OUT, "Cset_after_final_BA.npy"), np.array(Cset))
+    np.save(os.path.join(OUT, "Rset_after_final_BA.npy"), np.array(Rset))
 
     # ── Step 5: Final outputs ─────────────────────────────────────
     print("\n[5] Saving final reconstruction...")
 
     save_final_reconstruction(
         X_before_ba, X, Cset, Rset,
+        cam_indices=registered,
         out_path=os.path.join(OUT, "final_reconstruction.png"),
         title="Final Reconstruction (X vs Z)"
     )
+    print(f"  Saved {os.path.join(OUT, 'final_reconstruction.png')}")
 
+    # ── CHANGE 2: use X_very_beginning vs final X for a meaningful comparison ──
+    out_ba_final = os.path.join(OUT, "ba_final.png")
     save_ba_before_after_xz(
-        X_before_ba, X,
-        out_path=os.path.join(OUT, "ba_final.png"),
-        title="Final Bundle Adjustment"
+        X_very_beginning, X,
+        out_path=out_ba_final,
+        title="Initial Bootstrap vs Final Reconstruction",
+        Cset=Cset,
+        Rset=Rset
     )
+    print(f"  Saved {out_ba_final}")
 
+    out_pointcloud = os.path.join(OUT, "final_pointcloud.png")
     save_pointcloud_xz(
         X,
-        out_path=os.path.join(OUT, "final_pointcloud.png"),
+        out_path=out_pointcloud,
         title="Final 3D Point Cloud (X vs Z)"
     )
+    print(f"  Saved {out_pointcloud}")
+
+    for cam_idx in range(len(Cset)):
+        obs_indices = []
+        obs_pixels  = []
+        for pt_idx, track in enumerate(tracks):
+            if cam_idx in track:
+                obs_indices.append(pt_idx)
+                obs_pixels.append(track[cam_idx])
+        if len(obs_indices) == 0:
+            continue
+
+        X_obs = X[obs_indices]
+        x_obs = np.array(obs_pixels)
+
+        if images[cam_idx] is not None:
+            out_final_reproj = os.path.join(OUT, f"final_reproj_cam{cam_idx+1}.png")
+            save_reprojection_overlay(
+                images[cam_idx],
+                x_obs,
+                reproject(K, Cset[cam_idx], Rset[cam_idx], X_obs),
+                out_path=out_final_reproj,
+                title=f"Final reprojection — camera {cam_idx+1}"
+            )
+            print(f"  Saved {out_final_reproj}")
 
     np.save(os.path.join(OUT, "X_final.npy"),    X)
     np.save(os.path.join(OUT, "Cset_final.npy"), np.array(Cset))
     np.save(os.path.join(OUT, "Rset_final.npy"), np.array(Rset))
+    np.save(os.path.join(OUT, "tracks_final.npy"), tracks)
 
     print(f"\nDone. All outputs saved to ./{OUT}/")
     return Cset, Rset, X
@@ -452,7 +528,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Structure from Motion")
     parser.add_argument("--data_dir",   default="../P2Data/",                help="Folder with images + matching files")
     parser.add_argument("--calib",      default="../P2Data/calibration.txt", help="Calibration file")
-    parser.add_argument("--num_images", default=5, type=int,            help="Number of images")
+    parser.add_argument("--num_images", default=5, type=int,                 help="Number of images")
     args = parser.parse_args()
 
     run_sfm(
