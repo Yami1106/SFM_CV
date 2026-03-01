@@ -9,23 +9,18 @@ from matplotlib.patches import FancyArrowPatch
 from mpl_toolkits.mplot3d import Axes3D
 
 
-def ensure_dir(d: str):
+def check_dir(d: str):
     Path(d).mkdir(parents=True, exist_ok=True)
 
 
-def _save_fig(path: str, dpi: int = 200):
-    ensure_dir(str(Path(path).parent))
+def save_img(path: str, dpi: int = 200):
+    check_dir(str(Path(path).parent))
     plt.tight_layout()
     plt.savefig(path, dpi=dpi, bbox_inches="tight")
     plt.close()
     print(f"  Saved {path}")
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Camera frustum helper
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _draw_camera_frustum(ax, C, R, color='green', label=None, size=0.4):
+def camera_frustum(ax, C, R, color='green', label=None, size=0.4):
     forward  = R.T[:, 2]
     right    = R.T[:, 0]
 
@@ -47,15 +42,10 @@ def _draw_camera_frustum(ax, C, R, color='green', label=None, size=0.4):
     ax.add_patch(triangle)
 
 
-def _camera_colors(n):
+def camera_colors(n):
     base = ['#6B2D8B', '#D2691E', '#B8860B', '#2E8B57', '#DC143C',
             '#4169E1', '#FF8C00', '#008B8B', '#8B008B', '#556B2F']
     return [base[i % len(base)] for i in range(n)]
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Public API
-# ─────────────────────────────────────────────────────────────────────────────
 
 def save_matches_ransac(
     img1_bgr: np.ndarray,
@@ -90,7 +80,7 @@ def save_matches_ransac(
         cv2.circle(canvas, p1, 2, col, -1)
         cv2.circle(canvas, p2, 2, col, -1)
 
-    ensure_dir(str(Path(out_path).parent))
+    check_dir(str(Path(out_path).parent))
     cv2.imwrite(out_path, cv2.cvtColor(canvas, cv2.COLOR_RGB2BGR))
     print(f"  Saved {out_path}")
 
@@ -110,7 +100,7 @@ def save_reprojection_overlay(
     ax.scatter(x_obs[:,  0], x_obs[:,  1], s=8, c='lime',  label='detected',    zorder=3)
     ax.scatter(x_proj[:, 0], x_proj[:, 1], s=8, c='red',   label='reprojected', zorder=4)
     ax.legend(fontsize=8, loc='upper right')
-    _save_fig(out_path)
+    save_img(out_path)
 
 
 def save_candidate_poses_xz(
@@ -130,7 +120,7 @@ def save_candidate_poses_xz(
     ax.set_title(title, fontsize=11)
     ax.set_xlabel("x")
     ax.set_ylabel("z")
-    _save_fig(out_path)
+    save_img(out_path)
 
 
 def save_pointcloud_xz(
@@ -155,7 +145,7 @@ def save_pointcloud_xz(
     ax.set_title(title)
     ax.set_xlabel("x")
     ax.set_ylabel("z")
-    _save_fig(out_path)
+    save_img(out_path)
 
 
 def save_pointcloud_compare_xz(
@@ -176,15 +166,15 @@ def save_pointcloud_compare_xz(
                s=s, c='blue', alpha=0.7, label=label_b)
 
     if Cset is not None and Rset is not None:
-        cam_colors = _camera_colors(len(Cset))
+        cam_colors = camera_colors(len(Cset))
         for ci, (C, R) in enumerate(zip(Cset, Rset)):
-            _draw_camera_frustum(ax, C, R, color=cam_colors[ci], size=0.35)
+            camera_frustum(ax, C, R, color=cam_colors[ci], size=0.35)
 
     ax.legend(fontsize=8, loc='upper left')
     ax.set_title(title)
     ax.set_xlabel("x")
     ax.set_ylabel("z")
-    _save_fig(out_path)
+    save_img(out_path)
 
 
 def save_pnp_compare_xz(
@@ -219,7 +209,7 @@ def save_pnp_compare_xz(
     ax.set_title(title, fontsize=9)
     ax.set_xlabel("x")
     ax.set_ylabel("z")
-    _save_fig(out_path)
+    save_img(out_path)
 
 
 def save_ba_before_after_xz(
@@ -242,10 +232,10 @@ def save_ba_before_after_xz(
                s=s, c='red',  alpha=0.5, label='after bund adj',  zorder=2)
 
     if Cset is not None and Rset is not None:
-        cam_colors = _camera_colors(len(Cset))
+        cam_colors = camera_colors(len(Cset))
         for ci, (C, R) in enumerate(zip(Cset, Rset)):
             label = str(cam_indices[ci] + 1) if cam_indices is not None else str(ci + 1)
-            _draw_camera_frustum(ax, C, R, color=cam_colors[ci], size=2.5)
+            camera_frustum(ax, C, R, color=cam_colors[ci], size=2.5)
             ax.text(C[0], C[2] + 1.2, label,
                     fontsize=14, color='white', fontweight='bold',
                     ha='center', va='center', zorder=10,
@@ -260,7 +250,7 @@ def save_ba_before_after_xz(
     ax.legend(fontsize=9, loc='lower left',
               handles=[mpatches.Patch(color='blue', label='before bund adj'),
                        mpatches.Patch(color='red',  label='after bund adj')])
-    _save_fig(out_path)
+    save_img(out_path)
 
 
 def save_final_reconstruction(
@@ -281,10 +271,10 @@ def save_final_reconstruction(
     ax.scatter(np.asarray(X_after)[:,  0], np.asarray(X_after)[:,  2],
                s=4, c='red',  alpha=0.45, zorder=2, label='after bund adj')
 
-    cam_colors = _camera_colors(len(Cset))
+    cam_colors = camera_colors(len(Cset))
     for ci, (C, R) in enumerate(zip(Cset, Rset)):
         label = str(cam_indices[ci] + 1) if cam_indices is not None else str(ci + 1)
-        _draw_camera_frustum(ax, C, R, color=cam_colors[ci], size=2.5)
+        camera_frustum(ax, C, R, color=cam_colors[ci], size=2.5)
         ax.text(C[0], C[2] + 1.2, label,
                 fontsize=14, color='white', fontweight='bold',
                 ha='center', va='center', zorder=10,
@@ -299,7 +289,7 @@ def save_final_reconstruction(
     ax.legend(fontsize=9, loc='lower left',
               handles=[mpatches.Patch(color='blue', label='before bund adj'),
                        mpatches.Patch(color='red',  label='after bund adj')])
-    ensure_dir(str(Path(out_path).parent))
+    check_dir(str(Path(out_path).parent))
     plt.tight_layout()
     plt.savefig(out_path, dpi=200, bbox_inches="tight")
     plt.close()

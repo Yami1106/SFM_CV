@@ -1,6 +1,6 @@
 """
 Wrapper.py — Full Structure from Motion pipeline.
-All visualizations saved to ./outputs/ via Visualizations.py.
+All visualizations saved to ./outputs/ using Visualizations.py.
 
 Usage:
   python Wrapper.py --data_dir Data/ --calib Data/calibration.txt --num_images 5
@@ -40,12 +40,18 @@ from Visualizations import (
 OUT = "outputs"
 os.makedirs(OUT, exist_ok=True)
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Outlier filter — returns both filtered array AND boolean keep mask
-# ─────────────────────────────────────────────────────────────────────────────
-
+# this function is used to filter outliers from triangulated points  after each new camera is added and BA is run
 def filter_outliers_with_mask(X: np.ndarray, percentile: int = 95):
+    """
+    Inputs:
+      X          : (N,3) array of 3D points
+      percentile : distance threshold — points beyond this
+                   distance from the median are removed
+    Returns:
+      X_filtered : (M,3) array of inlier 3D points where M <= N
+      keep       : (N,) boolean array where True means the point was kept
+    """
+
     if len(X) == 0:
         return X, np.ones(0, dtype=bool)
     median = np.median(X, axis=0)
@@ -55,25 +61,45 @@ def filter_outliers_with_mask(X: np.ndarray, percentile: int = 95):
     return X[keep], keep
 
 
+# 
 def filter_outliers(X: np.ndarray, percentile: int = 95) -> np.ndarray:
+    """
+    Inputs:
+      X          : (N,3) array of 3D points
+      percentile : distance threshold — points beyond this
+                   distance from the median are removed
+    Returns:
+      X_filtered : (M,3) array of inlier 3D points where M <= N
+    """
+
     X_f, _ = filter_outliers_with_mask(X, percentile)
     return X_f
 
-
+# this function is used to filter both 3D points and tracks after each new camera is added and BA is run
 def filter_tracks_and_points(X: np.ndarray, tracks: list, percentile: int = 90):
+    """
+    Inputs:
+      X          : (N,3) array of 3D points
+      tracks     : list of N dicts where tracks[j][i] = (u,v) is the
+                   observed pixel of point j in camera i
+      percentile : distance threshold — points beyond this
+                   distance from the median are removed
+    Returns:
+      X_filtered      : (M,3) array of inlier 3D points where M <= N
+      tracks_filtered : list of M dicts corresponding to the kept points,
+                        synchronized with X_filtered
+    """
+
     X_filtered, keep = filter_outliers_with_mask(X, percentile)
     tracks_filtered  = [tracks[j] for j in range(len(tracks)) if keep[j]]
     return X_filtered, tracks_filtered
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Data loading
-# ─────────────────────────────────────────────────────────────────────────────
-
+# get the camera intrinsics from the calibration file
 def load_intrinsics(calib_path: str) -> np.ndarray:
     return np.loadtxt(calib_path)
 
-
+# load the images using OpenCV
 def load_image(data_dir: str, idx: int):
     for ext in (".jpg", ".png", ".JPG", ".PNG"):
         p = os.path.join(data_dir, f"{idx+1}{ext}")
@@ -81,7 +107,7 @@ def load_image(data_dir: str, idx: int):
             return cv2.imread(p)
     return None
 
-
+# load the matches form the matching.txt file
 def load_matches(data_dir: str):
     import glob, re
     matches = {}
@@ -125,19 +151,37 @@ def load_matches(data_dir: str):
         for k, v in matches.items()
     }
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Helpers
-# ─────────────────────────────────────────────────────────────────────────────
-
+# this is used to reproject 3D points into a camera for visualization
 def reproject(K, C, R, X) -> np.ndarray:
+    """
+    Inputs:
+      K : (3,3) intrinsic camera matrix
+      C : (3,)  camera center in world coordinates
+      R : (3,3) rotation matrix
+      X : (N,3) 3D world points
+    Returns:
+      x : (N,2) projected 2D pixel coordinates
+    """
+
     P   = camera_projection_matrix(K, C, R)
     X_h = make_homogeneous(X)
     x_h = (P @ X_h.T).T
     return x_h[:, :2] / x_h[:, 2:3]
 
 
-def collect_pnp_correspondences(cam_i, X, tracks):
+def get_pnp_correspondences(cam_i, X, tracks):
+    """
+    Inputs:
+      cam_i  : integer index of the camera being registered
+      X      : (N,3) array of current 3D world points
+      tracks : list of N dicts where tracks[j][i] = (u,v) is the
+               observed pixel of point j in camera i
+    Returns:
+      X_list : (M,3) array of 3D points visible in camera cam_i
+      x_list : (M,2) array of corresponding 2D pixel observations
+               in camera cam_i, where M <= N
+    """
+
     X_list, x_list = [], []
     for j, track in enumerate(tracks):
         if cam_i in track:
@@ -150,7 +194,16 @@ def collect_pnp_correspondences(cam_i, X, tracks):
     return np.array(X_list), np.array(x_list)
 
 
-def populate_tracks_for_new_camera(cam_i, tracks, clean):
+def tracks_for_new_camera(cam_i, tracks, clean):
+    """
+    Inputs:
+      cam_i  : integer index of the new camera being registered
+      tracks : list of N dicts where tracks[j][i] = (u,v) is the
+               observed pixel of point j in camera i 
+      clean  : dict mapping image pair (i,j) to (x_i, x_j) arrays
+               of (N,2) RANSAC-filtered pixel correspondences
+    """
+
     count = 0
     for j, track in enumerate(tracks):
         for cam_k in list(track.keys()):
@@ -180,7 +233,20 @@ def populate_tracks_for_new_camera(cam_i, tracks, clean):
     print(f"  Populated {count} track observations for camera {cam_i+1}")
 
 
-def find_best_reference_camera(cam_i, registered, clean):
+def find_best_ref(cam_i, registered, clean):
+
+    """
+    Inputs:
+      cam_i      : integer index of the new camera being registered
+      registered : list of integer indices of already registered cameras
+      clean      : dict mapping image pair (i,j) to (x_i, x_j) arrays
+                   of (N,2) RANSAC-filtered pixel correspondences
+    Returns:
+      best_ref   : integer index of the already registered camera that
+                   has the highest number of clean correspondences with
+                   cam_i — used as the triangulation reference camera
+    """
+
     best_ref, best_count = 0, 0
     for k in registered:
         key_fwd = (k, cam_i)
@@ -197,11 +263,23 @@ def find_best_reference_camera(cam_i, registered, clean):
     return best_ref
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Main pipeline
-# ─────────────────────────────────────────────────────────────────────────────
 
 def run_sfm(data_dir: str, calib_file: str, num_images: int):
+    """
+    Inputs:
+      data_dir   : path to directory containing input images and
+                   matching txt files
+      calib_file : path to calibration file containing the (3,3)
+                   intrinsic matrix K
+      num_images : integer number of images to process
+    Returns:
+      Cset       : list of I refined camera centers, each (3,),
+                   one per successfully registered camera
+      Rset       : list of I refined rotation matrices, each (3,3),
+                   one per successfully registered camera
+      X          : (J,3) array of final refined 3D world points
+                   after bundle adjustment and outlier filtering
+    """
 
     print("=" * 60)
     print("Structure from Motion — Full Pipeline")
@@ -213,7 +291,7 @@ def run_sfm(data_dir: str, calib_file: str, num_images: int):
 
     np.save(os.path.join(OUT, "matches_raw.npy"), matches)
 
-    # ── Step 1: RANSAC filter all pairs ──────────────────────────
+    # 1): RANSAC filter all pairs
     print("\n[1] Filtering correspondences with RANSAC...")
     clean = {}
     for (i, j), (x_i, x_j) in matches.items():
@@ -236,7 +314,7 @@ def run_sfm(data_dir: str, calib_file: str, num_images: int):
 
     np.save(os.path.join(OUT, "matches_clean.npy"), clean)
 
-    # ── Step 2: Bootstrap — images 1 & 2 ─────────────────────────
+    # 2): Bootstrap — images 1 & 2 
     print("\n[2] Bootstrapping from images 1 & 2...")
     if (0, 1) not in clean or len(clean[(0,1)][0]) < 8:
         raise RuntimeError("Not enough inliers between images 1 and 2 to bootstrap (need >=8)")
@@ -314,19 +392,19 @@ def run_sfm(data_dir: str, calib_file: str, num_images: int):
     registered = [0, 1]
     tracks     = [{0: tuple(x1[j]), 1: tuple(x2[j])} for j in range(len(X))]
 
-    # ── CHANGE 1: save the very first point cloud right after bootstrap ──
+    # save the very first point cloud
     X_very_beginning = X.copy()
 
     np.save(os.path.join(OUT, "tracks_init.npy"), tracks)
     np.save(os.path.join(OUT, "X_init.npy"), X)
 
-    # ── Step 3: Register cameras 3..I ───────────────────────────
+    # 3) Register cameras 3 to 5
     for i in range(2, num_images):
         print(f"\n[3] Registering camera {i+1}...")
 
-        populate_tracks_for_new_camera(i, tracks, clean)
+        tracks_for_new_camera(i, tracks, clean)
 
-        X_pnp, x_pnp = collect_pnp_correspondences(i, X, tracks)
+        X_pnp, x_pnp = get_pnp_correspondences(i, X, tracks)
         print(f"  Found {len(X_pnp)} 3D-2D correspondences for PnP")
 
         if len(X_pnp) < 6:
@@ -366,7 +444,7 @@ def run_sfm(data_dir: str, calib_file: str, num_images: int):
         Rset.append(R_new)
         registered.append(i)
 
-        ref = find_best_reference_camera(i, registered[:-1], clean)
+        ref = find_best_ref(i, registered[:-1], clean)
         ref_idx = registered.index(ref)
         ref_C, ref_R = Cset[ref_idx], Rset[ref_idx]
         print(f"  Using camera {ref+1} as triangulation reference")
@@ -445,7 +523,7 @@ def run_sfm(data_dir: str, calib_file: str, num_images: int):
         np.save(os.path.join(OUT, f"X_filtered_after_cam{i+1}.npy"), X)
         np.save(os.path.join(OUT, f"tracks_after_cam{i+1}.npy"), tracks)
 
-    # ── Step 4: Final BA ──────────────────────────────────────────
+    # 4): Final Bundle Adjustment 
     print(f"\n[4] Final Bundle Adjustment ({len(Cset)} cameras, {len(X)} points)...")
     V             = BuildVisibilityMatrix(tracks, num_cameras=len(Cset), num_points=len(X))
     X_before_ba   = X.copy()
@@ -457,7 +535,7 @@ def run_sfm(data_dir: str, calib_file: str, num_images: int):
     np.save(os.path.join(OUT, "Cset_after_final_BA.npy"), np.array(Cset))
     np.save(os.path.join(OUT, "Rset_after_final_BA.npy"), np.array(Rset))
 
-    # ── Step 5: Final outputs ─────────────────────────────────────
+    # 5) Final outputs 
     print("\n[5] Saving final reconstruction...")
 
     save_final_reconstruction(
@@ -468,7 +546,6 @@ def run_sfm(data_dir: str, calib_file: str, num_images: int):
     )
     print(f"  Saved {os.path.join(OUT, 'final_reconstruction.png')}")
 
-    # ── CHANGE 2: use X_very_beginning vs final X for a meaningful comparison ──
     out_ba_final = os.path.join(OUT, "ba_final.png")
     save_ba_before_after_xz(
         X_very_beginning, X,
@@ -518,11 +595,6 @@ def run_sfm(data_dir: str, calib_file: str, num_images: int):
 
     print(f"\nDone. All outputs saved to ./{OUT}/")
     return Cset, Rset, X
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Entry point
-# ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Structure from Motion")
