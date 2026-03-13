@@ -12,6 +12,7 @@ import os
 import json
 import math
 import numpy as np
+from skimage.metrics import structural_similarity as ssim
 
 from NeRFModel import *
 
@@ -30,7 +31,6 @@ def loadDataset(data_path, mode):
     """
 
     # read the transforms_train and test json files
-
     json_path = os.path.join(data_path, f"transforms_{mode}.json")
 
     with open(json_path, 'r') as f:
@@ -61,7 +61,6 @@ def loadDataset(data_path, mode):
     images = np.stack(images, axis=0)
     poses = np.stack(poses, axis=0)
 
-
     # calculate H,W and focal length 
     H = images.shape[1]
     W = images.shape[2]
@@ -82,7 +81,6 @@ def loadDataset(data_path, mode):
     }
 
     return images, poses, camera_info
-
 
 
 def PixelToRay(camera_info, pose, pixelPosition, args):
@@ -119,7 +117,6 @@ def PixelToRay(camera_info, pose, pixelPosition, args):
     rays_origin = np.repeat(t[None, :], repeats=dirs.shape[0], axis=0)
 
     return rays_origin, rays_direction
-
 
 
 def generateBatch(images, poses, camera_info, args):
@@ -168,7 +165,66 @@ def generateBatch(images, poses, camera_info, args):
     return rays_origin, rays_direction, rgb_gt
 
 
-def render(model, rays_origin, rays_direction, args):
+def prob_dist(z_vals, weights, N_samples, device):
+    # add small epsilon to prevent division by zero
+    weights = weights + 1e-5
+
+    # normalize weights to get a probability distribution (PDF)
+    pdf = weights / torch.sum(weights, dim=-1, keepdim=True)
+
+    # cumulative distribution function (CDF)
+    cdf = torch.cumsum(pdf, dim=-1)
+    cdf = torch.cat([torch.zeros_like(cdf[:, :1]), cdf], dim=-1)
+
+    # get uniform random samples
+    u = torch.rand(weights.shape[0], N_samples, device=device).contiguous()
+
+    # invert the CDF — find where each random sample falls
+    inds  = torch.searchsorted(cdf.contiguous(), u, right=True)
+    below = torch.clamp(inds - 1, min=0, max=z_vals.shape[-1] - 1)
+    above = torch.clamp(inds,     min=0, max=z_vals.shape[-1] - 1)
+
+    inds_g = torch.stack([below, above], dim=-1)
+
+    cdf_g = torch.gather(cdf,    1, inds_g.view(weights.shape[0], -1)).view(*inds_g.shape)
+    z_g   = torch.gather(z_vals, 1, inds_g.view(weights.shape[0], -1)).view(*inds_g.shape)
+
+    # linear interpolation to get exact sample position
+    denom = cdf_g[..., 1] - cdf_g[..., 0]
+    denom = torch.where(denom < 1e-5, torch.ones_like(denom), denom)
+    t     = (u - cdf_g[..., 0]) / denom
+
+    samples = z_g[..., 0] + t * (z_g[..., 1] - z_g[..., 0])
+    return samples
+
+
+def volume_rendering(rgb, sigma, z_vals, rays_direction, N_rays, device):
+    # get distance between adjacent sample points
+    dists = z_vals[:, 1:] - z_vals[:, :-1]
+
+    # final sample is very far away and can absorb any remaining transmittance
+    dists_last = 1e10 * torch.ones_like(dists[:, :1])
+    dists = torch.cat([dists, dists_last], dim=-1)
+
+    # ray direction magnitude is also important so include that too 
+    rays_normalized = torch.norm(rays_direction, dim=-1, keepdim=True)
+    dists = dists * rays_normalized
+
+    #volume rendering 
+    alpha = 1.0 - torch.exp(-sigma * dists)
+    transmittance = torch.cumprod(torch.cat([torch.ones((N_rays, 1), device=device), 1.0 - alpha + 1e-10], dim=-1), dim=-1)[:, :-1]
+
+    weights = alpha * transmittance
+
+    #finaal rgb value will be weighted sum 
+    rgb_final = torch.sum(weights.unsqueeze(-1) * rgb, dim=1)
+    acc_map = torch.sum(weights, dim=1, keepdim=True)
+    rgb_final = rgb_final + (1.0 - acc_map)
+
+    return rgb_final, weights
+
+
+def render(model, rays_origin, rays_direction, args, model_fine=None):
     """
     Input:
         model: NeRF model
@@ -177,7 +233,6 @@ def render(model, rays_origin, rays_direction, args):
     Outputs:
         rgb values of input rays
     """
-
 
     N_rays = rays_origin.shape[0]
     N_samples = int(args.n_sample)
@@ -212,34 +267,44 @@ def render(model, rays_origin, rays_direction, args):
     rgb = output[..., :3]
     sigma = output[..., 3]
 
-    # get the distance between adjacent sample points
-    dists = z_vals[:, 1:] - z_vals[:, :-1]
+    # coarse rgb and weights from volume rendering
+    rgb_coarse, weights_coarse = volume_rendering(rgb, sigma, z_vals, rays_direction, N_rays, device)
 
-    # final sample is very far away and can absorb any remaining transmittance
-    dists_last = 1e10 * torch.ones_like(dists[:, :1])
-    dists = torch.cat([dists, dists_last], dim=-1)
+    # print("sigma mean:", sigma.mean().item())
+    # print("weights mean:", weights_coarse.mean().item())
 
-    # ray direction magnitude is also important so include that too 
-    rays_normalized = torch.norm(rays_direction, dim=-1, keepdim=True)
-    dists = dists * rays_normalized
+    # if no fine model is provided return coarse result
+    if model_fine is None:
+        return rgb_coarse
 
-    #volume rendering 
-    alpha = 1.0 - torch.exp(-sigma * dists)
-    transmittance = torch.cumprod(torch.cat([torch.ones((N_rays, 1), device=device), 1.0 - alpha + 1e-10], dim=-1), dim=-1)[:, :-1]
+    # use coarse weights as a pdf to sample new points concentrated near surfaces
+    z_vals_fine = prob_dist(z_vals, weights_coarse.detach(), int(args.n_sample_fine), device)
 
-    weights = alpha * transmittance
+    # combine coarse and fine samples and sort by depth
+    z_vals_combined, _ = torch.sort(torch.cat([z_vals, z_vals_fine], dim=-1), dim=-1)
+
+    # calculate 3D sample points along each ray 
+    # this is equivalent to o+td
+    pts = rays_origin.unsqueeze(1) + rays_direction.unsqueeze(1) * z_vals_combined.unsqueeze(-1)
+
+    # viewing directions for input
+    view_dir = rays_direction / torch.norm(rays_direction, dim=-1, keepdim=True)
+    view_dir = view_dir.unsqueeze(1).expand_as(pts)
+
+    # flatten points to help model process all points together
+    pts_flat = pts.reshape(-1, 3)
+    view_dir_flat = view_dir.reshape(-1, 3)
+
+    output = model_fine(pts_flat, view_dir_flat)
+    output = output.reshape(N_rays, z_vals_combined.shape[1], 4)
+
+    rgb = output[..., :3]
+    sigma = output[..., 3]
 
     #finaal rgb value will be weighted sum 
-    rgb_final = torch.sum(weights.unsqueeze(-1) * rgb, dim=1)
-    acc_map = torch.sum(weights, dim=1, keepdim=True)
-    rgb_final = rgb_final + (1.0 - acc_map)
+    rgb_fine, _ = volume_rendering(rgb, sigma, z_vals_combined, rays_direction, N_rays, device)
 
-
-    print("sigma mean:", sigma.mean().item())
-    print("weights mean:", weights.mean().item())
-
-    return rgb_final
-
+    return rgb_coarse, rgb_fine
 
 
 def loss(groundtruth, prediction):
@@ -254,10 +319,88 @@ def loss(groundtruth, prediction):
     return torch.mean((groundtruth - prediction) ** 2)
 
 
-def train(images, poses, camera_info, args):
-    model = NeRFmodel(args.n_pos_freq, args.n_dirc_freq).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lrate)
+def compute_metrics(images, args):
+    image_paths = sorted(glob.glob(os.path.join(args.images_path, "test_*.png")))
 
+    psnr_list = []
+    ssim_list = []
+
+    for idx, pred_path in enumerate(image_paths):
+        pred = imageio.imread(pred_path).astype(np.float32) / 255.0
+        gt   = images[idx][..., :3]
+        pred = pred[..., :3]
+
+        mse  = np.mean((pred - gt) ** 2)
+        psnr = -10.0 * np.log10(mse) if mse > 0 else 100.0
+        psnr_list.append(psnr)
+
+        ssim_val = ssim(gt, pred, data_range=1.0, channel_axis=-1)
+        ssim_list.append(ssim_val)
+
+    avg_psnr = np.mean(psnr_list)
+    avg_ssim = np.mean(ssim_list)
+
+    print(f"Average PSNR: {avg_psnr:.4f} dB")
+    print(f"Average SSIM: {avg_ssim:.4f}")
+
+    with open(os.path.join(args.images_path, "metrics.txt"), "w") as f:
+        f.write(f"Average PSNR: {avg_psnr:.4f} dB\n")
+        f.write(f"Average SSIM: {avg_ssim:.4f}\n")
+        for i, (p, s) in enumerate(zip(psnr_list, ssim_list)):
+            f.write(f"  Image {i:03d}: PSNR={p:.4f}  SSIM={s:.4f}\n")
+
+    return avg_psnr, avg_ssim, psnr_list
+
+
+def save_comparison_images(images, args, n_best=3, n_worst=3):
+    image_paths = sorted(glob.glob(os.path.join(args.images_path, "test_*.png")))
+
+    psnr_list = []
+    for idx, pred_path in enumerate(image_paths):
+        pred = imageio.imread(pred_path).astype(np.float32) / 255.0
+        gt   = images[idx][..., :3]
+        mse  = np.mean((pred[..., :3] - gt) ** 2)
+        psnr = -10.0 * np.log10(mse) if mse > 0 else 100.0
+        psnr_list.append((psnr, idx, pred_path))
+
+    psnr_list.sort(key=lambda x: x[0])
+
+    worst = psnr_list[:n_worst]
+    best  = psnr_list[-n_best:][::-1]
+
+    for label, subset in [("best", best), ("worst", worst)]:
+        fig, axes = plt.subplots(len(subset), 2, figsize=(8, 4 * len(subset)))
+        for row, (psnr_val, idx, pred_path) in enumerate(subset):
+            gt   = images[idx][..., :3]
+            pred = imageio.imread(pred_path).astype(np.float32) / 255.0
+
+            axes[row, 0].imshow(np.clip(gt,   0, 1))
+            axes[row, 0].set_title(f"Ground Truth (idx {idx})")
+            axes[row, 0].axis("off")
+
+            axes[row, 1].imshow(np.clip(pred, 0, 1))
+            axes[row, 1].set_title(f"Predicted  PSNR={psnr_val:.2f}dB")
+            axes[row, 1].axis("off")
+
+        plt.tight_layout()
+        save_path = os.path.join(args.images_path, f"comparison_{label}.png")
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        plt.close()
+        print(f"Saved {save_path}")
+
+
+def train(images, poses, camera_info, args):
+    # loading coarse and fine models 
+    model = NeRFmodel(args.n_pos_freq, args.n_dirc_freq).to(device)
+    model_fine = NeRFmodel(args.n_pos_freq, args.n_dirc_freq).to(device)
+
+    # both networks should to be optimized together
+    optimizer = torch.optim.Adam(
+        list(model.parameters()) + list(model_fine.parameters()),
+        lr=args.lrate
+    )
+
+    # make the required folders to save respective files
     os.makedirs(args.logs_path, exist_ok=True)
     os.makedirs(args.checkpoint_path, exist_ok=True)
     os.makedirs(args.images_path, exist_ok=True)
@@ -272,27 +415,30 @@ def train(images, poses, camera_info, args):
             print("Loading checkpoint:", ckpt_path)
             ckpt = torch.load(ckpt_path, map_location=device)
             model.load_state_dict(ckpt["model_state_dict"])
+            model_fine.load_state_dict(ckpt["model_fine_state_dict"])
             optimizer.load_state_dict(ckpt["optimizer_state_dict"])
             start_iter = ckpt["iter"] + 1
 
     model.train()
+    model_fine.train()
 
+    # run the training loop
     for it in tqdm(range(start_iter, args.max_iters)):
-        # sample training rays
+        # training rays
         rays_origin, rays_direction, rgb_gt = generateBatch(images, poses, camera_info, args)
 
         # forward rendering
-        rgb_pred = render(model, rays_origin, rays_direction, args)
+        rgb_coarse, rgb_fine = render(model, rays_origin, rays_direction, args, model_fine=model_fine)
 
         # get the loss
-        train_loss = loss(rgb_gt, rgb_pred)
+        train_loss = loss(rgb_gt, rgb_coarse) + loss(rgb_gt, rgb_fine)
 
-        # backward pass
+        # backward prop and optimize
         optimizer.zero_grad()
         train_loss.backward()
         optimizer.step()
 
-        # tensorboard logging
+        # tensorboard log
         writer.add_scalar("train/loss", train_loss.item(), it)
 
         if it % 100 == 0:
@@ -304,26 +450,52 @@ def train(images, poses, camera_info, args):
             torch.save({
                 "iter": it,
                 "model_state_dict": model.state_dict(),
+                "model_fine_state_dict": model_fine.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
             }, ckpt_path)
             print(f"Saved checkpoint to {ckpt_path}")
 
-    writer.close()  
+    writer.close()
 
-# def test(images, poses, camera_info, args):
+
+def create_360_gif(args):
+    # get all rendered test images in order
+    image_paths = sorted(glob.glob(os.path.join(args.images_path, "test_*.png")))
+    
+    if len(image_paths) == 0:
+        print("No test images found to create GIF.")
+        return
+
+    gif_frames = []
+    for img_path in image_paths:
+        frame = imageio.imread(img_path)
+        gif_frames.append(frame)
+
+    # save as gif
+    gif_path = os.path.join(args.images_path, "360_view.gif")
+    imageio.mimwrite(gif_path, gif_frames, fps=10, loop=0)
+    print(f"Saved 360 GIF to {gif_path}")
+
+
 def test(images, poses, camera_info, args):
+    # load both coarse and fine models
     model = NeRFmodel(args.n_pos_freq, args.n_dirc_freq).to(device)
+    model_fine = NeRFmodel(args.n_pos_freq, args.n_dirc_freq).to(device)
 
     ckpts = sorted(glob.glob(os.path.join(args.checkpoint_path, "*.pth")))
     if len(ckpts) == 0:
         raise FileNotFoundError("No checkpoint found for testing.")
 
+    # load the latest checkpoint
     ckpt_path = ckpts[-1]
     print("Loading checkpoint:", ckpt_path)
     ckpt = torch.load(ckpt_path, map_location=device)
     model.load_state_dict(ckpt["model_state_dict"])
+    model_fine.load_state_dict(ckpt["model_fine_state_dict"])
 
+    # set both models to evaluation mode
     model.eval()
+    model_fine.eval()
 
     os.makedirs(args.images_path, exist_ok=True)
 
@@ -331,9 +503,11 @@ def test(images, poses, camera_info, args):
     W = camera_info["W"]
 
     with torch.no_grad():
+        # loop through each test image and render it
         for idx in range(len(images)):
             pose = poses[idx]
 
+            # create a grid of pixel coordinates for the image
             xs, ys = np.meshgrid(np.arange(W), np.arange(H), indexing='xy')
             pixel_positions = np.stack([xs.reshape(-1), ys.reshape(-1)], axis=-1).astype(np.float32)
 
@@ -342,6 +516,7 @@ def test(images, poses, camera_info, args):
             rays_origin = torch.tensor(rays_origin, dtype=torch.float32, device=device)
             rays_direction = torch.tensor(rays_direction, dtype=torch.float32, device=device)
 
+            # render image in chunck to avoid running out of memory
             rgb_chunks = []
             total_rays = rays_origin.shape[0]
 
@@ -350,7 +525,7 @@ def test(images, poses, camera_info, args):
                 rays_origin_chunk = rays_origin[start:end]
                 rays_direction_chunk = rays_direction[start:end]
 
-                rgb_chunk = render(model, rays_origin_chunk, rays_direction_chunk, args)
+                _, rgb_chunk = render(model, rays_origin_chunk, rays_direction_chunk, args, model_fine=model_fine)
                 rgb_chunks.append(rgb_chunk.cpu())
 
             rgb_pred = torch.cat(rgb_chunks, dim=0)
@@ -362,6 +537,19 @@ def test(images, poses, camera_info, args):
             imageio.imwrite(save_path, (pred_img * 255).astype(np.uint8))
 
             print(f"Saved {save_path}")
+
+    # generate 360 gif from saved test images
+    print("Generating 360 GIF...")
+    create_360_gif(args)
+
+    # get metrics
+    print("Computing PSNR and SSIM...")
+    compute_metrics(images, args)
+
+    # save best and worst comparisons
+    print("Saving comparison images...")
+    save_comparison_images(images, args)
+
 
 def main(args):
     # load data
@@ -376,6 +564,7 @@ def main(args):
         args.load_checkpoint = True
         test(images, poses, camera_info, args)
 
+
 def configParser():
     parser = argparse.ArgumentParser()
     parser.add_argument('--data_path',default="./Phase2/data/lego/",help="dataset path")
@@ -384,7 +573,8 @@ def configParser():
     parser.add_argument('--n_pos_freq',type=int,default=10,help="number of positional encoding frequencies for position")
     parser.add_argument('--n_dirc_freq',type=int,default=4,help="number of positional encoding frequencies for viewing direction")
     parser.add_argument('--n_rays_batch',type=int,default=32*32*4,help="number of rays per batch")
-    parser.add_argument('--n_sample',type=int,default=400,help="number of sample per ray")
+    parser.add_argument('--n_sample',type=int,default=64,help="number of sample per ray")
+    parser.add_argument('--n_sample_fine',type=int,default=128,help="number of fine samples per ray")
     parser.add_argument('--max_iters',type=int,default=10000,help="number of max iterations for training")
     parser.add_argument('--logs_path',default="./logs/",help="logs path")
     parser.add_argument('--checkpoint_path',default="./Phase2/example_checkpoint/",help="checkpoints path")
@@ -393,11 +583,11 @@ def configParser():
     parser.add_argument('--images_path', default="./image/",help="folder to store images")
     parser.add_argument('--chunk_size', type=int, default=4096, help="number of rays to render at once during testing")
 
-
     # bounds for ray sampling
     parser.add_argument('--near', default=2.0, type=float, help="near bound")
     parser.add_argument('--far', default=6.0, type=float, help="far bound")
     return parser
+
 
 if __name__ == "__main__":
     parser = configParser()
