@@ -4,7 +4,7 @@ import numpy as np
 import torch.nn.functional as F
 
 class NeRFmodel(nn.Module):
-    def __init__(self, embed_pos_L, embed_direction_L):
+    def __init__(self, embed_pos_L, embed_direction_L,use_pe=True):
         super(NeRFmodel, self).__init__()
         #############################
         # network initialization
@@ -20,16 +20,18 @@ class NeRFmodel(nn.Module):
         Output :
         None
         '''
+        self.use_pe = use_pe
         self.embed_pos_L = embed_pos_L
         self.embed_direction_L = embed_direction_L
 
         hidden_dimensions = 256
         # original xyz(3) + 3(coordinates) * 2(sin and cos values per freq) *L frequencies
-        self.pos_dimensions = 3 + 3*2*embed_pos_L
-
+        #self.pos_dimensions = 3 + 3*2*embed_pos_L
+        self.pos_dimensions = (3 + 3*2*embed_pos_L) if use_pe else 3
+        
         # original direction(3) + 3(coordinates) * 2(sin and cos values per freq) *L frequencies
-        self.dir_dimensions = 3 + 3*2*embed_direction_L
-
+        #self.dir_dimensions = 3 + 3*2*embed_direction_L
+        self.dir_dimensions = (3 + 3*2*embed_direction_L) if use_pe else 3
         # 8-layers of  MLP 
 
         self.fc1 = nn.Linear(self.pos_dimensions,hidden_dimensions)
@@ -98,8 +100,15 @@ class NeRFmodel(nn.Module):
         '''
 
         # position encoding and direction encoding
+
         pos_enc = self.position_encoding(pos,self.embed_pos_L)
         dir_enc = self.position_encoding(direction,self.embed_direction_L)
+        # if self.use_pe:
+        #     pos_enc = self.position_encoding(pos, self.embed_pos_L)
+        #     dir_enc = self.position_encoding(direction, self.embed_direction_L)
+        # else:
+        #     pos_enc = pos
+        #     dir_enc = direction
 
         # position branch 
         x = F.relu(self.fc1(pos_enc))

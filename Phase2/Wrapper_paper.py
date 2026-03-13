@@ -12,6 +12,7 @@ import os
 import json
 import math
 import numpy as np
+from skimage.metrics import structural_similarity as ssim
 
 from NeRFModel import *
 
@@ -175,7 +176,7 @@ def prob_dist(z_vals, weights, N_samples, device):
     cdf = torch.cumsum(pdf, dim=-1)
     cdf = torch.cat([torch.zeros_like(cdf[:, :1]), cdf], dim=-1)
 
-    # draw uniform random samples
+    # get uniform random samples
     u = torch.rand(weights.shape[0], N_samples, device=device).contiguous()
 
     # invert the CDF — find where each random sample falls
@@ -198,7 +199,7 @@ def prob_dist(z_vals, weights, N_samples, device):
 
 
 def volume_rendering(rgb, sigma, z_vals, rays_direction, N_rays, device):
-    # get the distance between adjacent sample points
+    # get distance between adjacent sample points
     dists = z_vals[:, 1:] - z_vals[:, :-1]
 
     # final sample is very far away and can absorb any remaining transmittance
@@ -318,16 +319,88 @@ def loss(groundtruth, prediction):
     return torch.mean((groundtruth - prediction) ** 2)
 
 
+def compute_metrics(images, args):
+    image_paths = sorted(glob.glob(os.path.join(args.images_path, "test_*.png")))
+
+    psnr_list = []
+    ssim_list = []
+
+    for idx, pred_path in enumerate(image_paths):
+        pred = imageio.imread(pred_path).astype(np.float32) / 255.0
+        gt   = images[idx][..., :3]
+        pred = pred[..., :3]
+
+        mse  = np.mean((pred - gt) ** 2)
+        psnr = -10.0 * np.log10(mse) if mse > 0 else 100.0
+        psnr_list.append(psnr)
+
+        ssim_val = ssim(gt, pred, data_range=1.0, channel_axis=-1)
+        ssim_list.append(ssim_val)
+
+    avg_psnr = np.mean(psnr_list)
+    avg_ssim = np.mean(ssim_list)
+
+    print(f"Average PSNR: {avg_psnr:.4f} dB")
+    print(f"Average SSIM: {avg_ssim:.4f}")
+
+    with open(os.path.join(args.images_path, "metrics.txt"), "w") as f:
+        f.write(f"Average PSNR: {avg_psnr:.4f} dB\n")
+        f.write(f"Average SSIM: {avg_ssim:.4f}\n")
+        for i, (p, s) in enumerate(zip(psnr_list, ssim_list)):
+            f.write(f"  Image {i:03d}: PSNR={p:.4f}  SSIM={s:.4f}\n")
+
+    return avg_psnr, avg_ssim, psnr_list
+
+
+def save_comparison_images(images, args, n_best=3, n_worst=3):
+    image_paths = sorted(glob.glob(os.path.join(args.images_path, "test_*.png")))
+
+    psnr_list = []
+    for idx, pred_path in enumerate(image_paths):
+        pred = imageio.imread(pred_path).astype(np.float32) / 255.0
+        gt   = images[idx][..., :3]
+        mse  = np.mean((pred[..., :3] - gt) ** 2)
+        psnr = -10.0 * np.log10(mse) if mse > 0 else 100.0
+        psnr_list.append((psnr, idx, pred_path))
+
+    psnr_list.sort(key=lambda x: x[0])
+
+    worst = psnr_list[:n_worst]
+    best  = psnr_list[-n_best:][::-1]
+
+    for label, subset in [("best", best), ("worst", worst)]:
+        fig, axes = plt.subplots(len(subset), 2, figsize=(8, 4 * len(subset)))
+        for row, (psnr_val, idx, pred_path) in enumerate(subset):
+            gt   = images[idx][..., :3]
+            pred = imageio.imread(pred_path).astype(np.float32) / 255.0
+
+            axes[row, 0].imshow(np.clip(gt,   0, 1))
+            axes[row, 0].set_title(f"Ground Truth (idx {idx})")
+            axes[row, 0].axis("off")
+
+            axes[row, 1].imshow(np.clip(pred, 0, 1))
+            axes[row, 1].set_title(f"Predicted  PSNR={psnr_val:.2f}dB")
+            axes[row, 1].axis("off")
+
+        plt.tight_layout()
+        save_path = os.path.join(args.images_path, f"comparison_{label}.png")
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        plt.close()
+        print(f"Saved {save_path}")
+
+
 def train(images, poses, camera_info, args):
+    # loading coarse and fine models 
     model = NeRFmodel(args.n_pos_freq, args.n_dirc_freq).to(device)
     model_fine = NeRFmodel(args.n_pos_freq, args.n_dirc_freq).to(device)
 
-    # both networks need to be optimized together
+    # both networks should to be optimized together
     optimizer = torch.optim.Adam(
         list(model.parameters()) + list(model_fine.parameters()),
         lr=args.lrate
     )
 
+    # make the required folders to save respective files
     os.makedirs(args.logs_path, exist_ok=True)
     os.makedirs(args.checkpoint_path, exist_ok=True)
     os.makedirs(args.images_path, exist_ok=True)
@@ -349,8 +422,9 @@ def train(images, poses, camera_info, args):
     model.train()
     model_fine.train()
 
+    # run the training loop
     for it in tqdm(range(start_iter, args.max_iters)):
-        # sample training rays
+        # training rays
         rays_origin, rays_direction, rgb_gt = generateBatch(images, poses, camera_info, args)
 
         # forward rendering
@@ -359,12 +433,12 @@ def train(images, poses, camera_info, args):
         # get the loss
         train_loss = loss(rgb_gt, rgb_coarse) + loss(rgb_gt, rgb_fine)
 
-        # backward pass
+        # backward prop and optimize
         optimizer.zero_grad()
         train_loss.backward()
         optimizer.step()
 
-        # tensorboard logging
+        # tensorboard log
         writer.add_scalar("train/loss", train_loss.item(), it)
 
         if it % 100 == 0:
@@ -384,8 +458,27 @@ def train(images, poses, camera_info, args):
     writer.close()
 
 
-# def test(images, poses, camera_info, args):
+def create_360_gif(args):
+    # get all rendered test images in order
+    image_paths = sorted(glob.glob(os.path.join(args.images_path, "test_*.png")))
+    
+    if len(image_paths) == 0:
+        print("No test images found to create GIF.")
+        return
+
+    gif_frames = []
+    for img_path in image_paths:
+        frame = imageio.imread(img_path)
+        gif_frames.append(frame)
+
+    # save as gif
+    gif_path = os.path.join(args.images_path, "360_view.gif")
+    imageio.mimwrite(gif_path, gif_frames, fps=10, loop=0)
+    print(f"Saved 360 GIF to {gif_path}")
+
+
 def test(images, poses, camera_info, args):
+    # load both coarse and fine models
     model = NeRFmodel(args.n_pos_freq, args.n_dirc_freq).to(device)
     model_fine = NeRFmodel(args.n_pos_freq, args.n_dirc_freq).to(device)
 
@@ -393,12 +486,14 @@ def test(images, poses, camera_info, args):
     if len(ckpts) == 0:
         raise FileNotFoundError("No checkpoint found for testing.")
 
+    # load the latest checkpoint
     ckpt_path = ckpts[-1]
     print("Loading checkpoint:", ckpt_path)
     ckpt = torch.load(ckpt_path, map_location=device)
     model.load_state_dict(ckpt["model_state_dict"])
     model_fine.load_state_dict(ckpt["model_fine_state_dict"])
 
+    # set both models to evaluation mode
     model.eval()
     model_fine.eval()
 
@@ -408,9 +503,11 @@ def test(images, poses, camera_info, args):
     W = camera_info["W"]
 
     with torch.no_grad():
+        # loop through each test image and render it
         for idx in range(len(images)):
             pose = poses[idx]
 
+            # create a grid of pixel coordinates for the image
             xs, ys = np.meshgrid(np.arange(W), np.arange(H), indexing='xy')
             pixel_positions = np.stack([xs.reshape(-1), ys.reshape(-1)], axis=-1).astype(np.float32)
 
@@ -419,6 +516,7 @@ def test(images, poses, camera_info, args):
             rays_origin = torch.tensor(rays_origin, dtype=torch.float32, device=device)
             rays_direction = torch.tensor(rays_direction, dtype=torch.float32, device=device)
 
+            # render image in chunck to avoid running out of memory
             rgb_chunks = []
             total_rays = rays_origin.shape[0]
 
@@ -439,6 +537,18 @@ def test(images, poses, camera_info, args):
             imageio.imwrite(save_path, (pred_img * 255).astype(np.uint8))
 
             print(f"Saved {save_path}")
+
+    # generate 360 gif from saved test images
+    print("Generating 360 GIF...")
+    create_360_gif(args)
+
+    # get metrics
+    print("Computing PSNR and SSIM...")
+    compute_metrics(images, args)
+
+    # save best and worst comparisons
+    print("Saving comparison images...")
+    save_comparison_images(images, args)
 
 
 def main(args):
