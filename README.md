@@ -1,84 +1,51 @@
-# Buildings built in minutes - SfM 
+<div align="center">
 
-This project implements a complete incremental Structure from Motion pipeline from scratch using Python and NumPy, reconstructing a sparse 3D point cloud of Unity Hall at WPI from a set of monocular images.
+<pre>
+╔════════════════╗
+║     🏛️  SFM_CV  🏛️     ║
+╚════════════════╝
+</pre>
 
----
+## Structure from Motion
 
+![Python](https://img.shields.io/badge/Python-3776AB?style=flat&logo=python&logoColor=white) ![OpenCV](https://img.shields.io/badge/OpenCV-5C3EE8?style=flat&logo=opencv&logoColor=white)
 
-##  System Configuration
-
-- **OS**: Ubuntu 24.04 LTS
-- **GPU**: NVIDIA GeForce RTX 5060 Laptop
-- **Python**: 3.10+
-
-### Core Dependencies
-
-| Library | Purpose |
-|---------|---------|
-| numpy | Linear algebra, matrix operations |
-| scipy | Nonlinear optimization (least_squares) |
-| opencv-python | Image loading and visualization |
-| matplotlib | Point cloud and camera pose plotting |
+</div>
 
 ---
 
-## 📁 Folder Structure
+## About
 
-```text
-Group9_p2.zip
-|   └── Phase1/
-|       ├── GetInliersRANSAC.py
-|       ├── EstimateFundamentalMatrix.py
-|       ├── EssentialMatrixFromFundamentalMatrix.py
-|       ├── ExtractCameraPose.py
-|       ├── LinearTriangulation.py
-|       ├── DisambiguateCameraPose.py
-|       ├── NonlinearTriangulation.py
-|       ├── PnPRANSAC.py
-|       ├── NonlinearPnP.py
-|       ├── BuildVisibilityMatrix.py
-|       ├── BundleAdjustment.py
-|       ├── Visualizations.py
-|       ├── Wrapper.py
-├──  Report.pdf
-└──  README.md
-```
+A **Structure from Motion (SfM)** pipeline for 3D reconstruction from unordered 2D image collections. Recovers both the sparse 3D point cloud of a scene and the camera poses simultaneously using feature matching and bundle adjustment.
 
 ---
 
-##  Getting Started
+## Features
 
-### Step 1: Create a Virtual Environment
-
-```bash
-python3 -m venv venv
-source venv/bin/activate
-```
-
-### Step 2: Install Dependencies
-
-```bash
-pip install --upgrade pip
-pip install numpy scipy opencv-python matplotlib
-```
+- SIFT / ORB feature extraction and matching
+- Fundamental and Essential matrix estimation (RANSAC)
+- Triangulation and incremental reconstruction
+- Bundle adjustment for global refinement
 
 ---
 
-##  Running the Pipeline
+## Tech Stack
 
-Run all commands from the `Phase1/` directory.
-
-```bash
-cd Phase1/
-python Wrapper.py --data_dir ../P2Data/ --calib ../P2Data/calibration.txt --num_images 5
-```
-
-### Arguments
-
-| Argument | Default | Description |
-|----------|---------|-------------|
-| `--data_dir` | `../P2Data/` | Path to folder containing images and matching files |
-| `--calib` | `../P2Data/calibration.txt` | Path to calibration file with intrinsic matrix K |
-| `--num_images` | `5` | Number of images to process |
+**Python** · **OpenCV** · **NumPy** · **SciPy**
 
 ---
+
+## Tags
+
+`3D Reconstruction`  `Photogrammetry`  `Computer Vision`
+
+---
+
+## Author
+
+**Ashish (Yami1106)**
+[GitHub](https://github.com/Yami1106) · [Portfolio](https://yamiportfolio.netlify.app/)
+
+---
+
+*Generated with [Automate_contribution](https://github.com/Yami1106/Automate_contribution)*
